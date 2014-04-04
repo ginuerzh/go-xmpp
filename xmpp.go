@@ -14,7 +14,7 @@ package xmpp
 
 import (
 	"bufio"
-	"bytes"
+	//"bytes"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/tls"
@@ -31,19 +31,11 @@ import (
 	"strings"
 )
 
-const (
-	nsStream = "http://etherx.jabber.org/streams"
-	nsTLS    = "urn:ietf:params:xml:ns:xmpp-tls"
-	nsSASL   = "urn:ietf:params:xml:ns:xmpp-sasl"
-	nsBind   = "urn:ietf:params:xml:ns:xmpp-bind"
-	nsClient = "jabber:client"
-)
-
-var DefaultConfig tls.Config
+var DefaultConfig tls.Config = tls.Config{InsecureSkipVerify: true}
 
 type Client struct {
-	conn   net.Conn // connection to server
-	jid    string   // Jabber ID for our connection
+	conn   io.ReadWriteCloser // connection to server
+	jid    string             // Jabber ID for our connection
 	domain string
 	p      *xml.Decoder
 }
@@ -128,9 +120,7 @@ func (o Options) NewClient() (*Client, error) {
 	}
 
 	client := new(Client)
-	if o.NoTLS {
-		client.conn = c
-	} else {
+	if !o.NoTLS {
 		tlsconn := tls.Client(c, &DefaultConfig)
 		if err = tlsconn.Handshake(); err != nil {
 			return nil, err
@@ -141,7 +131,13 @@ func (o Options) NewClient() (*Client, error) {
 		if err = tlsconn.VerifyHostname(host); err != nil {
 			return nil, err
 		}
-		client.conn = tlsconn
+		c = tlsconn
+	}
+
+	client.conn = c
+	// For debugging: the following causes the plaintext of the connection to be duplicated to stdout.
+	if o.Debug {
+		client.conn = tee{c, os.Stdout}
 	}
 
 	if err := client.init(&o); err != nil {
@@ -215,10 +211,6 @@ func cnonce() string {
 
 func (c *Client) init(o *Options) error {
 	c.p = xml.NewDecoder(c.conn)
-	// For debugging: the following causes the plaintext of the connection to be duplicated to stdout.
-	if o.Debug {
-		c.p = xml.NewDecoder(tee{c.conn, os.Stdout})
-	}
 
 	a := strings.SplitN(o.User, "@", 2)
 	if len(a) != 2 {
@@ -228,11 +220,9 @@ func (c *Client) init(o *Options) error {
 	domain := a[1]
 
 	// Declare intent to be a jabber client.
-	fmt.Fprintf(c.conn, "<?xml version='1.0'?>\n"+
-		"<stream:stream to='%s' xmlns='%s'\n"+
-		" xmlns:stream='%s' version='1.0'>\n",
-		xmlEscape(domain), nsClient, nsStream)
-
+	//fmt.Fprintf(c.conn, streamElem(domain))
+	//c.SendOrg(streamElem(domain))
+	c.Send(streamElem{domain: domain})
 	// Server should respond with a stream opening.
 	se, err := nextStart(c.p)
 	if err != nil {
@@ -251,26 +241,26 @@ func (c *Client) init(o *Options) error {
 	}
 	mechanism := ""
 	for _, m := range f.Mechanisms.Mechanism {
-		if m == "PLAIN" {
+		if m == mechanPlain {
 			mechanism = m
 			// Plain authentication: send base64-encoded \x00 user \x00 password.
 			raw := "\x00" + user + "\x00" + o.Password
 			enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
 			base64.StdEncoding.Encode(enc, []byte(raw))
-			fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='PLAIN'>%s</auth>\n",
-				nsSASL, enc)
+			c.Send(saslAuth{Mechanism: mechanPlain, Value: string(enc)})
 			break
 		}
-		if m == "DIGEST-MD5" {
+		if m == mechanMd5 {
+			continue
 			mechanism = m
 			// Digest-MD5 authentication
-			fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='DIGEST-MD5'/>\n",
-				nsSASL)
+			///fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='DIGEST-MD5'/>\n", nsSASL)
+			c.Send(saslAuth{Mechanism: mechanMd5})
 			var ch saslChallenge
 			if err = c.p.DecodeElement(&ch, nil); err != nil {
 				return errors.New("unmarshal <challenge>: " + err.Error())
 			}
-			b, err := base64.StdEncoding.DecodeString(string(ch))
+			b, err := base64.StdEncoding.DecodeString(ch.Value)
 			if err != nil {
 				return err
 			}
@@ -293,17 +283,20 @@ func (c *Client) init(o *Options) error {
 			nonceCount := fmt.Sprintf("%08x", 1)
 			digest := saslDigestResponse(user, realm, o.Password, nonce, cnonceStr, "AUTHENTICATE", digestUri, nonceCount)
 			message := "username=" + user + ", realm=" + realm + ", nonce=" + nonce + ", cnonce=" + cnonceStr + ", nc=" + nonceCount + ", qop=" + qop + ", digest-uri=" + digestUri + ", response=" + digest + ", charset=" + charset
-			fmt.Fprintf(c.conn, "<response xmlns='%s'>%s</response>\n", nsSASL, base64.StdEncoding.EncodeToString([]byte(message)))
+			///fmt.Fprintf(c.conn, "<response xmlns='%s'>%s</response>\n", nsSASL, base64.StdEncoding.EncodeToString([]byte(message)))
+			c.Send(saslResponse{Value: base64.StdEncoding.EncodeToString([]byte(message))})
 
-			var rspauth saslRspAuth
+			var rspauth saslSuccess
 			if err = c.p.DecodeElement(&rspauth, nil); err != nil {
-				return errors.New("unmarshal <challenge>: " + err.Error())
+				return errors.New("unmarshal <success>: " + err.Error())
 			}
-			b, err = base64.StdEncoding.DecodeString(string(rspauth))
+			b, err = base64.StdEncoding.DecodeString(rspauth.Value)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(c.conn, "<response xmlns='%s'/>\n", nsSASL)
+			//fmt.Println(string(b))
+			///fmt.Fprintf(c.conn, "<response xmlns='%s'/>\n", nsSASL)
+			c.Send(saslResponse{})
 			break
 		}
 	}
@@ -328,9 +321,8 @@ func (c *Client) init(o *Options) error {
 
 	// Now that we're authenticated, we're supposed to start the stream over again.
 	// Declare intent to be a jabber client.
-	fmt.Fprintf(c.conn, "<stream:stream to='%s' xmlns='%s'\n"+
-		" xmlns:stream='%s' version='1.0'>\n",
-		xmlEscape(domain), nsClient, nsStream)
+	///fmt.Fprintf(c.conn, streamElem(domain))
+	c.Send(&streamElem{domain: domain})
 
 	// Here comes another <stream> and <features>.
 	se, err = nextStart(c.p)
@@ -345,21 +337,30 @@ func (c *Client) init(o *Options) error {
 		//return os.NewError("unmarshal <features>: " + err.String())
 	}
 
+	//fmt.Println("method:", f.Compress.Method, f.Session.XMLName.Local, f.Bind.XMLName.Local)
 	// Send IQ message asking to bind to the local user name.
+	iq := NewIQ(IQSet, "")
 	if o.Resource == "" {
-		fmt.Fprintf(c.conn, "<iq type='set' id='x'><bind xmlns='%s'></bind></iq>\n", nsBind)
+		///fmt.Fprintf(c.conn, "<iq type='set' id='x'><bind xmlns='%s'></bind></iq>\n", nsBind)
+		iq.SetElem(bindBind{})
 	} else {
-		fmt.Fprintf(c.conn, "<iq type='set' id='x'><bind xmlns='%s'><resource>%s</resource></bind></iq>\n", nsBind, o.Resource)
+		//fmt.Fprintf(c.conn, "<iq type='set' id='x'><bind xmlns='%s'><resource>%s</resource></bind></iq>\n", nsBind, o.Resource)
+		iq.SetElem(bindBind{Resource: o.Resource})
 	}
-	var iq clientIQ
+	c.Send(iq)
+
+	//var iq clientIQ
+	iq.SetElem(bindBind{})
 	if err = c.p.DecodeElement(&iq, nil); err != nil {
 		return errors.New("unmarshal <iq>: " + err.Error())
 	}
-	if &iq.Bind == nil {
-		return errors.New("<iq> result missing <bind>")
-	}
-	c.jid = iq.Bind.Jid // our local id
-
+	fmt.Println("afsdfsdf", iq)
+	/*
+		if &iq.Bind == nil {
+			return errors.New("<iq> result missing <bind>")
+		}
+		c.jid = iq.Bind.Jid // our local id
+	*/
 	// We're connected and can now receive and send messages.
 	fmt.Fprintf(c.conn, "<presence xml:lang='en'><show>xa</show><status>I for one welcome our new codebot overlords.</status></presence>")
 	return nil
@@ -396,141 +397,21 @@ func (c *Client) Recv() (event interface{}, err error) {
 	panic("unreachable")
 }
 
+/*
 // Send sends message text.
 func (c *Client) Send(chat Chat) {
 	fmt.Fprintf(c.conn, "<message to='%s' type='%s' xml:lang='en'>"+
 		"<body>%s</body></message>",
 		xmlEscape(chat.Remote), xmlEscape(chat.Type), xmlEscape(chat.Text))
 }
+*/
+func (c *Client) Send(elem Elementer) {
+	fmt.Fprint(c.conn, elem.String())
+}
 
 // Send origin
 func (c *Client) SendOrg(org string) {
 	fmt.Fprint(c.conn, org)
-}
-
-// RFC 3920  C.1  Streams name space
-type streamFeatures struct {
-	XMLName    xml.Name `xml:"http://etherx.jabber.org/streams features"`
-	StartTLS   tlsStartTLS
-	Mechanisms saslMechanisms
-	Bind       bindBind
-	Session    bool
-}
-
-type streamError struct {
-	XMLName xml.Name `xml:"http://etherx.jabber.org/streams error"`
-	Any     xml.Name
-	Text    string
-}
-
-// RFC 3920  C.3  TLS name space
-
-type tlsStartTLS struct {
-	XMLName  xml.Name `xml:":ietf:params:xml:ns:xmpp-tls starttls"`
-	Required bool
-}
-
-type tlsProceed struct {
-	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-tls proceed"`
-}
-
-type tlsFailure struct {
-	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-tls failure"`
-}
-
-// RFC 3920  C.4  SASL name space
-
-type saslMechanisms struct {
-	XMLName   xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl mechanisms"`
-	Mechanism []string `xml:"mechanism"`
-}
-
-type saslAuth struct {
-	XMLName   xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl auth"`
-	Mechanism string   `xml:",attr"`
-}
-
-type saslChallenge string
-
-type saslRspAuth string
-
-type saslResponse string
-
-type saslAbort struct {
-	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl abort"`
-}
-
-type saslSuccess struct {
-	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl success"`
-}
-
-type saslFailure struct {
-	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl failure"`
-	Any     xml.Name
-}
-
-// RFC 3920  C.5  Resource binding name space
-
-type bindBind struct {
-	XMLName  xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-bind bind"`
-	Resource string
-	Jid      string `xml:"jid"`
-}
-
-// RFC 3921  B.1  jabber:client
-
-type clientMessage struct {
-	XMLName xml.Name `xml:"jabber:client message"`
-	From    string   `xml:"from,attr"`
-	Id      string   `xml:"id,attr"`
-	To      string   `xml:"to,attr"`
-	Type    string   `xml:"type,attr"` // chat, error, groupchat, headline, or normal
-
-	// These should technically be []clientText,
-	// but string is much more convenient.
-	Subject string `xml:"subject"`
-	Body    string `xml:"body"`
-	Thread  string `xml:"thread"`
-
-	// Any hasn't matched element
-	Other []string `xml:",any"`
-}
-
-type clientText struct {
-	Lang string `xml:",attr"`
-	Body string `xml:"chardata"`
-}
-
-type clientPresence struct {
-	XMLName xml.Name `xml:"jabber:client presence"`
-	From    string   `xml:"from,attr"`
-	Id      string   `xml:"id,attr"`
-	To      string   `xml:"to,attr"`
-	Type    string   `xml:"type,attr"` // error, probe, subscribe, subscribed, unavailable, unsubscribe, unsubscribed
-	Lang    string   `xml:"lang,attr"`
-
-	Show     string `xml:"show"`        // away, chat, dnd, xa
-	Status   string `xml:"status,attr"` // sb []clientText
-	Priority string `xml:"priority,attr"`
-	Error    *clientError
-}
-
-type clientIQ struct { // info/query
-	XMLName xml.Name `xml:"jabber:client iq"`
-	From    string   `xml:",attr"`
-	Id      string   `xml:",attr"`
-	To      string   `xml:",attr"`
-	Type    string   `xml:",attr"` // error, get, result, set
-	Error   clientError
-	Bind    bindBind
-}
-
-type clientError struct {
-	XMLName xml.Name `xml:"jabber:client error"`
-	Code    string   `xml:",attr"`
-	Type    string   `xml:",attr"`
-	Any     xml.Name
-	Text    string
 }
 
 // Scan XML token stream to find next StartElement.
@@ -543,6 +424,8 @@ func nextStart(p *xml.Decoder) (xml.StartElement, error) {
 		switch t := t.(type) {
 		case xml.StartElement:
 			return t, nil
+		case xml.EndElement:
+			return xml.StartElement{}, errors.New("End Element")
 		}
 	}
 	panic("unreachable")
@@ -605,37 +488,31 @@ func next(p *xml.Decoder) (xml.Name, interface{}, error) {
 	return se.Name, nv, err
 }
 
-var xmlSpecial = map[byte]string{
-	'<':  "&lt;",
-	'>':  "&gt;",
-	'"':  "&quot;",
-	'\'': "&apos;",
-	'&':  "&amp;",
-}
-
-func xmlEscape(s string) string {
-	var b bytes.Buffer
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if s, ok := xmlSpecial[c]; ok {
-			b.WriteString(s)
-		} else {
-			b.WriteByte(c)
-		}
-	}
-	return b.String()
-}
-
 type tee struct {
-	r io.Reader
+	c net.Conn
 	w io.Writer
 }
 
 func (t tee) Read(p []byte) (n int, err error) {
-	n, err = t.r.Read(p)
+	n, err = t.c.Read(p)
 	if n > 0 {
+		t.w.Write([]byte(">>> "))
 		t.w.Write(p[0:n])
 		t.w.Write([]byte("\n"))
 	}
 	return
+}
+
+func (t tee) Write(p []byte) (n int, err error) {
+	n, err = t.c.Write(p)
+	if n > 0 {
+		t.w.Write([]byte("<<< "))
+		t.w.Write(p[:n])
+		t.w.Write([]byte("\n"))
+	}
+	return
+}
+
+func (t tee) Close() error {
+	return t.c.Close()
 }

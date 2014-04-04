@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"github.com/mattn/go-xmpp"
+	"github.com/ginuerzh/go-xmpp"
 	"log"
 	"os"
 	"strings"
@@ -62,7 +62,7 @@ func main() {
 
 		tokens := strings.SplitN(line, " ", 2)
 		if len(tokens) == 2 {
-			talk.Send(xmpp.Chat{Remote: tokens[0], Type: "chat", Text: tokens[1]})
+			//talk.Send(xmpp.Chat{Remote: tokens[0], Type: "chat", Text: tokens[1]})
 		}
 	}
 }
