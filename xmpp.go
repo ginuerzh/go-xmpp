@@ -523,7 +523,7 @@ func NewConn(conn net.Conn, logger io.Writer) *Conn {
 
 func (t *Conn) Read(p []byte) (n int, err error) {
 	n, err = t.c.Read(p)
-	if n > 0 {
+	if n > 0 && t.w != nil {
 		t.w.Write([]byte(">>> "))
 		t.w.Write(p[0:n])
 		t.w.Write([]byte("\n"))
@@ -533,7 +533,7 @@ func (t *Conn) Read(p []byte) (n int, err error) {
 
 func (t *Conn) Write(p []byte) (n int, err error) {
 	n, err = t.c.Write(p)
-	if n > 0 {
+	if n > 0 && t.w != nil {
 		t.w.Write([]byte("<<< "))
 		t.w.Write(p[:n])
 		t.w.Write([]byte("\n"))
