@@ -2,9 +2,9 @@
 package xmpp
 
 import (
-	"bytes"
+	//"bytes"
 	"encoding/xml"
-	"fmt"
+	//"fmt"
 )
 
 const (
@@ -12,7 +12,9 @@ const (
 	nsTLS    = "urn:ietf:params:xml:ns:xmpp-tls"
 	nsSASL   = "urn:ietf:params:xml:ns:xmpp-sasl"
 	nsBind   = "urn:ietf:params:xml:ns:xmpp-bind"
+	nsStanza = "urn:ietf:params:xml:ns:xmpp-stanzas"
 	nsClient = "jabber:client"
+	nsRoster = "jabber:iq:roster"
 )
 
 const (
@@ -20,31 +22,42 @@ const (
 	mechanMd5   = "DIGEST-MD5"
 )
 
-const (
-	IQGet    = "get"
-	IQSet    = "set"
-	IQResult = "result"
-	IQError  = "error"
-)
-
-type Elementer interface {
-	String() string
+type elementer interface {
+	Name() string
 }
 
-type streamElem struct {
-	domain string
+type xmppStream struct {
+	XMLName xml.Name `xml:"http://etherx.jabber.org/streams stream"`
+	NS      string   `xml:",attr"`
+	Id      string   `xml:"id,attr,omitempty"`
+	From    string   `xml:"from,attr,omitempty"`
+	To      string   `xml:"to,attr,omitempty"`
+	Version string   `xml:"version,attr"`
 }
 
-func (s streamElem) String() string {
+func streamElement(domain string) []byte {
+	return []byte("<stream:stream " +
+		"xmlns='jabber:client' " +
+		"xmlns:stream='http://etherx.jabber.org/streams' " +
+		"version='1.0' " +
+		" to='" + domain + "'>")
+}
+
+func (s xmppStream) Name() string {
+	return "stream"
+}
+
+/*
+func (s xmppStream) String() string {
 	b := new(bytes.Buffer)
-	xml.EscapeText(b, []byte(s.domain))
+	xml.EscapeText(b, []byte(s.To))
 
 	return fmt.Sprintf(xml.Header+
 		"<stream:stream to='%s' xmlns='%s'"+
 		" xmlns:stream='%s' version='1.0'>",
 		b.String(), nsClient, nsStream)
 }
-
+*/
 type iqAuth struct {
 	XMLName xml.Name `xml:"http://jabber.org/features/iq-auth auth"`
 }
@@ -56,13 +69,17 @@ type iqRegister struct {
 // RFC 3920  C.1  Streams name space
 type streamFeatures struct {
 	XMLName    xml.Name `xml:"http://etherx.jabber.org/streams features"`
-	StartTLS   tlsStartTLS
-	Mechanisms saslMechanisms
-	Compress   compression
-	Bind       bindBind
-	Session    session
-	Auth       iqAuth
-	Register   iqRegister
+	StartTLS   *tlsStartTLS
+	Mechanisms *saslMechanisms
+	Compress   *compression
+	Bind       *bindBind
+	Session    *session
+	Auth       *iqAuth
+	Register   *iqRegister
+}
+
+func (e streamFeatures) Name() string {
+	return "stream-eatures"
 }
 
 type streamError struct {
@@ -71,19 +88,43 @@ type streamError struct {
 	Text    string
 }
 
+func (e streamError) Name() string {
+	return "stream-error"
+}
+
 // RFC 3920  C.3  TLS name space
 
 type tlsStartTLS struct {
-	XMLName  xml.Name `xml:":ietf:params:xml:ns:xmpp-tls starttls"`
-	Required bool
+	XMLName xml.Name  `xml:"urn:ietf:params:xml:ns:xmpp-tls starttls"`
+	Any     *xml.Name `xml:",any"`
+}
+
+func (e tlsStartTLS) Required() bool {
+	return e.Any != nil && e.Any.Local == "required"
+}
+
+func (e tlsStartTLS) Name() string {
+	return "tls-starttls"
 }
 
 type tlsProceed struct {
 	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-tls proceed"`
 }
 
+func (e tlsProceed) Name() string {
+	return "tls-proceed"
+}
+
 type tlsFailure struct {
 	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-tls failure"`
+}
+
+func (e tlsFailure) Name() string {
+	return "tls-failure"
+}
+
+func (e tlsFailure) Error() string {
+	return "tls failure"
 }
 
 // RFC 3920  C.4  SASL name space
@@ -99,9 +140,8 @@ type saslAuth struct {
 	Value     string   `xml:",chardata"`
 }
 
-func (sa saslAuth) String() string {
-	b, _ := xml.Marshal(sa)
-	return string(b)
+func (e saslAuth) Name() string {
+	return "sasl-auth"
 }
 
 type saslChallenge struct {
@@ -109,20 +149,29 @@ type saslChallenge struct {
 	Value   string   `xml:",chardata"`
 }
 
+func (e saslChallenge) Name() string {
+	return "sasl-challenge"
+}
+
 type saslResponse struct {
 	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl response"`
 	Value   string   `xml:",chardata"`
 }
 
-func (sr saslResponse) String() string {
-	b, _ := xml.Marshal(sr)
-	return string(b)
+func (e saslResponse) Name() string {
+	return "sasl-response"
 }
-
-type saslRspAuth string
 
 type saslAbort struct {
 	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl abort"`
+}
+
+func (e saslAbort) Name() string {
+	return "sasl-abort"
+}
+
+func (e saslAbort) Error() string {
+	return "abort"
 }
 
 type saslSuccess struct {
@@ -130,14 +179,21 @@ type saslSuccess struct {
 	Value   string   `xml:",chardata"`
 }
 
-func (ss saslSuccess) String() string {
-	b, _ := xml.Marshal(ss)
-	return string(b)
+func (e saslSuccess) Name() string {
+	return "sasl-success"
 }
 
 type saslFailure struct {
-	Name xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl failure"`
-	Any  xml.Name
+	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-sasl failure"`
+	Any     xml.Name `xml:",any"`
+}
+
+func (e saslFailure) Name() string {
+	return "sasl-failure"
+}
+
+func (e saslFailure) Error() string {
+	return e.Any.Local
 }
 
 // RFC 3920  C.5  Resource binding name space
@@ -148,9 +204,8 @@ type bindBind struct {
 	Jid      string   `xml:"jid,omitempty"`
 }
 
-func (bind bindBind) String() string {
-	b, _ := xml.Marshal(bind)
-	return string(b)
+func (e bindBind) Name() string {
+	return "bind"
 }
 
 type session struct {
@@ -163,38 +218,6 @@ type compression struct {
 }
 
 // RFC 3921  B.1  jabber:client
-
-type Stanza struct {
-	Id   string `xml:"id,attr,omitempty"`
-	Type string `xml:"type,attr"`
-	From string `xml:"from,attr,omitempty"`
-	To   string `xml:"to,attr,omitempty"`
-
-	SubElem interface{}
-}
-
-type IQ struct {
-	XMLName xml.Name `xml:"iq"`
-	Stanza
-}
-
-func NewIQ(t string, to string) *IQ {
-	return &IQ{
-		Stanza: Stanza{
-			Type: t,
-			To:   to,
-		},
-	}
-}
-
-func (iq *IQ) SetElem(elem Elementer) {
-	iq.SubElem = elem
-}
-
-func (iq IQ) String() string {
-	b, _ := xml.Marshal(iq)
-	return string(b)
-}
 
 type clientMessage struct {
 	XMLName xml.Name `xml:"jabber:client message"`
@@ -229,23 +252,5 @@ type clientPresence struct {
 	Show     string `xml:"show"`        // away, chat, dnd, xa
 	Status   string `xml:"status,attr"` // sb []clientText
 	Priority string `xml:"priority,attr"`
-	Error    *clientError
-}
-
-type clientIQ struct { // info/query
-	XMLName xml.Name `xml:"jabber:client iq"`
-	From    string   `xml:",attr"`
-	Id      string   `xml:",attr"`
-	To      string   `xml:",attr"`
-	Type    string   `xml:",attr"` // error, get, result, set
-	Error   clientError
-	Bind    bindBind
-}
-
-type clientError struct {
-	XMLName xml.Name `xml:"jabber:client error"`
-	Code    string   `xml:",attr"`
-	Type    string   `xml:",attr"`
-	Any     xml.Name
-	Text    string
+	Error    *stanError
 }

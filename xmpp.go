@@ -33,11 +33,383 @@ import (
 
 var DefaultConfig tls.Config = tls.Config{InsecureSkipVerify: true}
 
+type HandlerFunc func(client *Client, sta Stanzar)
+
+type RosterHandler func(roster *Roster)
+
+type PresenceHandler func(presence *Presence)
+
+type Options struct {
+	// Resource specifies an XMPP client resource, like "bot", instead of accepting one
+	// from the server.  Use "" to let the server generate one for your client.
+	Resource string
+
+	// NoTLS disables TLS and specifies that a plain old unencrypted TCP connection should
+	// be used.
+	NoTLS bool
+
+	TlsConfig *tls.Config
+
+	// Debug output
+	Debug bool
+}
+
 type Client struct {
-	conn   io.ReadWriteCloser // connection to server
-	jid    string             // Jabber ID for our connection
-	domain string
-	p      *xml.Decoder
+	// Host specifies what host to connect to, as either "hostname" or "hostname:port"
+	// If host is not specified, the  DNS SRV should be used to find the host from the domainpart of the JID.
+	// Default the port to 5222.
+	Host string
+
+	// User specifies what user to authenticate to the remote server.
+	User string
+
+	// Password supplies the password to use for authentication with the remote server.
+	Password string
+
+	// Jabber ID for our connection
+	Jid string
+
+	// connection to server
+	conn *Conn
+
+	// handler for received stanzas
+	handler         HandlerFunc
+	rosterHandler   RosterHandler
+	presenceHandler PresenceHandler
+
+	p *xml.Decoder
+
+	Opts *Options
+}
+
+func (c *Client) RosterHandleFunc(handler RosterHandler) {
+	c.rosterHandler = handler
+}
+
+func (c *Client) PresenceHandleFunc(handler PresenceHandler) {
+	c.presenceHandler = handler
+}
+
+func (c *Client) Start() error {
+	if c.Opts == nil {
+		c.Opts = &Options{
+			TlsConfig: &DefaultConfig,
+		}
+	}
+
+	host := c.Host
+	conn, err := connect(host, c.User, c.Password)
+	if err != nil {
+		return err
+	}
+
+	if c.Opts.Debug {
+		c.conn = NewConn(conn, os.Stdout)
+	} else {
+		c.conn = NewConn(conn, nil)
+	}
+
+	if !c.Opts.NoTLS {
+		if err := c.conn.handshake(c.Host, c.Opts.TlsConfig); err != nil {
+			return err
+		}
+	}
+
+	if err := c.init(); err != nil {
+		c.Close()
+		return err
+	}
+
+	return nil
+}
+
+func (c *Client) StartAndRecv(handler HandlerFunc) error {
+	if err := c.Start(); err != nil {
+		return err
+	}
+
+	for {
+		st, err := c.Recv()
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+		if handler != nil {
+			handler(c, st)
+		}
+	}
+}
+
+func (c *Client) Recv() (Stanzar, error) {
+	se, err := nextStart(c.p)
+	if err != nil {
+		return nil, err
+	}
+	var st elementer
+	switch se.Name.Space + " " + se.Name.Local {
+	case nsClient + " iq":
+		st = &stanIQ{}
+	case nsClient + " presence":
+		st = &stanPresence{}
+	default:
+		return nil, errors.New("unexpected XMPP message " +
+			se.Name.Space + " <" + se.Name.Local + "/>")
+	}
+
+	// Unmarshal into that storage.
+	if err = c.p.DecodeElement(st, &se); err != nil {
+		return nil, err
+	}
+
+	switch st.Name() {
+	case "iq":
+		iq := st.(*stanIQ)
+		if iq.Roster != nil && c.rosterHandler != nil {
+			c.rosterHandler(decodeRoster(iq.Roster))
+		}
+	case "presence":
+		if c.presenceHandler != nil {
+			p := &Presence{}
+			p.decode(st.(*stanPresence))
+			c.presenceHandler(p)
+		}
+	}
+	return nil, nil
+}
+
+func (c *Client) recvElem(e elementer) (err error) {
+	se, err := nextStart(c.p)
+	if err != nil {
+		return err
+	}
+
+	switch se.Name.Space + " " + se.Name.Local {
+	// stream start element
+	case nsStream + " stream":
+		if _, ok := e.(*xmppStream); !ok {
+			return errors.New("xmpp: expected <stream> but got <" +
+				se.Name.Local + "> in " + se.Name.Space)
+		}
+		return nil
+	// sasl failure
+	case nsSASL + " failure":
+		fail := &saslFailure{}
+		err = fail
+		e = fail
+		// sasl abort
+	case nsSASL + " abort":
+		abort := &saslAbort{}
+		err = abort
+		e = abort
+		// tls failture
+	case nsTLS + " failure":
+		fail := &tlsFailure{}
+		err = fail
+		e = fail
+	}
+
+	if err := c.p.DecodeElement(e, &se); err != nil {
+		return err
+	}
+
+	return
+}
+
+func (c *Client) send(e elementer) error {
+	b, err := xml.Marshal(e)
+	if err != nil {
+		return err
+	}
+
+	return c.sendRaw(b)
+}
+
+func (c *Client) sendRaw(data []byte) error {
+	_, err := c.conn.Write(data)
+	return err
+}
+
+func (c *Client) Send(st Stanzar) error {
+	return c.sendRaw(st.Encode())
+}
+
+func (c *Client) request(req elementer, resp elementer) error {
+	if err := c.send(req); err != nil {
+		return err
+	}
+	return c.recvElem(resp)
+}
+
+func (c *Client) init() error {
+	c.p = xml.NewDecoder(c.conn)
+
+	a := strings.SplitN(c.User, "@", 2)
+	if len(a) != 2 {
+		return errors.New("xmpp: invalid username (want user@domain): " + c.User)
+	}
+	user := a[0]
+	domain := a[1]
+
+	if err := c.sendRaw(streamElement(domain)); err != nil {
+		return err
+	}
+	// Declare intent to be a jabber client.
+	// Server should respond with a stream opening.
+	if err := c.recvElem(&xmppStream{}); err != nil {
+		return err
+	}
+
+	// Now we're in the stream and can use Unmarshal.
+	// Next message should be <features> to tell us authentication options.
+	// See section 4.6 in RFC 3920.
+	var f streamFeatures
+	if err := c.recvElem(&f); err != nil {
+		return errors.New("unmarshal <features>: " + err.Error())
+	}
+	//fmt.Println("features:", f)
+
+	if f.StartTLS != nil && f.StartTLS.Required() {
+		if err := c.request(&tlsStartTLS{}, &tlsProceed{}); err != nil {
+			return err
+		}
+		if err := c.conn.handshake(domain, c.Opts.TlsConfig); err != nil {
+			return err
+		}
+
+		if err := c.sendRaw(streamElement(domain)); err != nil {
+			return err
+		}
+		if err := c.recvElem(&xmppStream{}); err != nil {
+			return err
+		}
+
+		f = streamFeatures{}
+		if err := c.recvElem(&f); err != nil {
+			return errors.New("unmarshal <features>: " + err.Error())
+		}
+		//fmt.Println("features:", f)
+	}
+
+	mechanism := ""
+	for _, m := range f.Mechanisms.Mechanism {
+		if m == mechanPlain {
+			mechanism = m
+			// Plain authentication: send base64-encoded \x00 user \x00 password.
+			raw := "\x00" + user + "\x00" + c.Password
+			enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
+			base64.StdEncoding.Encode(enc, []byte(raw))
+			c.send(&saslAuth{Mechanism: mechanPlain, Value: string(enc)})
+			break
+		}
+		if m == mechanMd5 {
+			continue
+			mechanism = m
+			// Digest-MD5 authentication
+			var ch saslChallenge
+			if err := c.request(saslAuth{Mechanism: mechanMd5}, &ch); err != nil {
+				return errors.New("unmarshal <challenge>: " + err.Error())
+			}
+
+			b, err := base64.StdEncoding.DecodeString(ch.Value)
+			if err != nil {
+				return err
+			}
+			tokens := map[string]string{}
+			for _, token := range strings.Split(string(b), ",") {
+				kv := strings.SplitN(strings.TrimSpace(token), "=", 2)
+				if len(kv) == 2 {
+					if kv[1][0] == '"' && kv[1][len(kv[1])-1] == '"' {
+						kv[1] = kv[1][1 : len(kv[1])-1]
+					}
+					tokens[kv[0]] = kv[1]
+				}
+			}
+			realm, _ := tokens["realm"]
+			nonce, _ := tokens["nonce"]
+			qop, _ := tokens["qop"]
+			charset, _ := tokens["charset"]
+			cnonceStr := cnonce()
+			digestUri := "xmpp/" + domain
+			nonceCount := fmt.Sprintf("%08x", 1)
+			digest := saslDigestResponse(user, realm, c.Password, nonce, cnonceStr, "AUTHENTICATE", digestUri, nonceCount)
+			message := "username=" + user + ", realm=" + realm + ", nonce=" + nonce + ", cnonce=" + cnonceStr + ", nc=" + nonceCount + ", qop=" + qop + ", digest-uri=" + digestUri + ", response=" + digest + ", charset=" + charset
+			///fmt.Fprintf(c.conn, "<response xmlns='%s'>%s</response>\n", nsSASL, base64.StdEncoding.EncodeToString([]byte(message)))
+			c.send(&saslResponse{Value: base64.StdEncoding.EncodeToString([]byte(message))})
+
+			var rspauth saslSuccess
+			if err := c.request(&saslResponse{Value: base64.StdEncoding.EncodeToString([]byte(message))}, &rspauth); err != nil {
+				return errors.New("unmarshal <success>: " + err.Error())
+			}
+			b, err = base64.StdEncoding.DecodeString(rspauth.Value)
+			if err != nil {
+				return err
+			}
+			//fmt.Println(string(b))
+			///fmt.Fprintf(c.conn, "<response xmlns='%s'/>\n", nsSASL)
+			c.send(&saslResponse{})
+			break
+		}
+	}
+	if mechanism == "" {
+		return errors.New(fmt.Sprintf("PLAIN authentication is not an option: %v", f.Mechanisms.Mechanism))
+	}
+
+	// Next message should be either success or failure.
+	var v saslSuccess
+	err := c.recvElem(&v)
+	if err != nil {
+		return err
+	}
+
+	// Now that we're authenticated, we're supposed to start the stream over again.
+	// Declare intent to be a jabber client.
+	// Here comes another <stream> and <features>.
+	if err := c.sendRaw(streamElement(domain)); err != nil {
+		return err
+	}
+	if err := c.recvElem(&xmppStream{}); err != nil {
+		return err
+	}
+
+	f = streamFeatures{}
+	if err := c.recvElem(&f); err != nil {
+		return errors.New("unmarshal <features>: " + err.Error())
+	}
+
+	// Send IQ message asking to bind to the local user name.
+	iq := &stanIQ{}
+	iq.T = IQSet
+	iq.Bind = &bindBind{}
+	if c.Opts.Resource != "" {
+		//fmt.Fprintf(c.conn, "<iq type='set' id='x'><bind xmlns='%s'><resource>%s</resource></bind></iq>\n", nsBind, o.Resource)
+		iq.Bind = &bindBind{Resource: c.Opts.Resource}
+	}
+	resIQ := stanIQ{}
+	if err := c.request(iq, &resIQ); err != nil {
+		return errors.New("unmarshal <iq>: " + err.Error())
+	}
+
+	if resIQ.Bind == nil {
+		return errors.New("<iq> result missing <bind>")
+	}
+	c.Jid = resIQ.Bind.Jid // our local id
+	fmt.Println("Jid:", c.Jid)
+	// We're connected and can now receive and send messages.
+	//p := StanPresence{}
+	//return c.Send(p)
+
+	return nil
+}
+
+func (c *Client) SyncRoster() error {
+	iq := &stanIQ{}
+	iq.T = IQGet
+	iq.Roster = &rosterQuery{}
+	return c.send(iq)
+}
+
+func (c *Client) Close() error {
+	return c.conn.Close()
 }
 
 func connect(host, user, passwd string) (net.Conn, error) {
@@ -86,96 +458,6 @@ func connect(host, user, passwd string) (net.Conn, error) {
 	return c, nil
 }
 
-// Options are used to specify additional options for new clients, such as a Resource.
-type Options struct {
-	// Host specifies what host to connect to, as either "hostname" or "hostname:port"
-	// If host is not specified, the  DNS SRV should be used to find the host from the domainpart of the JID.
-	// Default the port to 5222.
-	Host string
-
-	// User specifies what user to authenticate to the remote server.
-	User string
-
-	// Password supplies the password to use for authentication with the remote server.
-	Password string
-
-	// Resource specifies an XMPP client resource, like "bot", instead of accepting one
-	// from the server.  Use "" to let the server generate one for your client.
-	Resource string
-
-	// NoTLS disables TLS and specifies that a plain old unencrypted TCP connection should
-	// be used.
-	NoTLS bool
-
-	// Debug output
-	Debug bool
-}
-
-// NewClient establishes a new Client connection based on a set of Options.
-func (o Options) NewClient() (*Client, error) {
-	host := o.Host
-	c, err := connect(host, o.User, o.Password)
-	if err != nil {
-		return nil, err
-	}
-
-	client := new(Client)
-	if !o.NoTLS {
-		tlsconn := tls.Client(c, &DefaultConfig)
-		if err = tlsconn.Handshake(); err != nil {
-			return nil, err
-		}
-		if strings.LastIndex(o.Host, ":") > 0 {
-			host = host[:strings.LastIndex(o.Host, ":")]
-		}
-		if err = tlsconn.VerifyHostname(host); err != nil {
-			return nil, err
-		}
-		c = tlsconn
-	}
-
-	client.conn = c
-	// For debugging: the following causes the plaintext of the connection to be duplicated to stdout.
-	if o.Debug {
-		client.conn = tee{c, os.Stdout}
-	}
-
-	if err := client.init(&o); err != nil {
-		client.Close()
-		return nil, err
-	}
-
-	return client, nil
-}
-
-// NewClient creates a new connection to a host given as "hostname" or "hostname:port".
-// If host is not specified, the  DNS SRV should be used to find the host from the domainpart of the JID.
-// Default the port to 5222.
-func NewClient(host, user, passwd string, debug bool) (*Client, error) {
-	opts := Options{
-		Host:     host,
-		User:     user,
-		Password: passwd,
-		Debug:    debug,
-	}
-	return opts.NewClient()
-}
-
-func NewClientNoTLS(host, user, passwd string, debug bool) (*Client, error) {
-	opts := Options{
-		Host:     host,
-		User:     user,
-		Password: passwd,
-		NoTLS:    true,
-		Debug:    debug,
-	}
-	return opts.NewClient()
-}
-
-func (c *Client) Close() error {
-	return c.conn.Close()
-}
-
 func saslDigestResponse(username, realm, passwd, nonce, cnonceStr,
 	authenticate, digestUri, nonceCountStr string) string {
 	h := func(text string) []byte {
@@ -209,216 +491,12 @@ func cnonce() string {
 	return fmt.Sprintf("%016x", cn)
 }
 
-func (c *Client) init(o *Options) error {
-	c.p = xml.NewDecoder(c.conn)
-
-	a := strings.SplitN(o.User, "@", 2)
-	if len(a) != 2 {
-		return errors.New("xmpp: invalid username (want user@domain): " + o.User)
-	}
-	user := a[0]
-	domain := a[1]
-
-	// Declare intent to be a jabber client.
-	//fmt.Fprintf(c.conn, streamElem(domain))
-	//c.SendOrg(streamElem(domain))
-	c.Send(streamElem{domain: domain})
-	// Server should respond with a stream opening.
-	se, err := nextStart(c.p)
-	if err != nil {
-		return err
-	}
-	if se.Name.Space != nsStream || se.Name.Local != "stream" {
-		return errors.New("xmpp: expected <stream> but got <" + se.Name.Local + "> in " + se.Name.Space)
-	}
-
-	// Now we're in the stream and can use Unmarshal.
-	// Next message should be <features> to tell us authentication options.
-	// See section 4.6 in RFC 3920.
-	var f streamFeatures
-	if err = c.p.DecodeElement(&f, nil); err != nil {
-		return errors.New("unmarshal <features>: " + err.Error())
-	}
-	mechanism := ""
-	for _, m := range f.Mechanisms.Mechanism {
-		if m == mechanPlain {
-			mechanism = m
-			// Plain authentication: send base64-encoded \x00 user \x00 password.
-			raw := "\x00" + user + "\x00" + o.Password
-			enc := make([]byte, base64.StdEncoding.EncodedLen(len(raw)))
-			base64.StdEncoding.Encode(enc, []byte(raw))
-			c.Send(saslAuth{Mechanism: mechanPlain, Value: string(enc)})
-			break
-		}
-		if m == mechanMd5 {
-			continue
-			mechanism = m
-			// Digest-MD5 authentication
-			///fmt.Fprintf(c.conn, "<auth xmlns='%s' mechanism='DIGEST-MD5'/>\n", nsSASL)
-			c.Send(saslAuth{Mechanism: mechanMd5})
-			var ch saslChallenge
-			if err = c.p.DecodeElement(&ch, nil); err != nil {
-				return errors.New("unmarshal <challenge>: " + err.Error())
-			}
-			b, err := base64.StdEncoding.DecodeString(ch.Value)
-			if err != nil {
-				return err
-			}
-			tokens := map[string]string{}
-			for _, token := range strings.Split(string(b), ",") {
-				kv := strings.SplitN(strings.TrimSpace(token), "=", 2)
-				if len(kv) == 2 {
-					if kv[1][0] == '"' && kv[1][len(kv[1])-1] == '"' {
-						kv[1] = kv[1][1 : len(kv[1])-1]
-					}
-					tokens[kv[0]] = kv[1]
-				}
-			}
-			realm, _ := tokens["realm"]
-			nonce, _ := tokens["nonce"]
-			qop, _ := tokens["qop"]
-			charset, _ := tokens["charset"]
-			cnonceStr := cnonce()
-			digestUri := "xmpp/" + domain
-			nonceCount := fmt.Sprintf("%08x", 1)
-			digest := saslDigestResponse(user, realm, o.Password, nonce, cnonceStr, "AUTHENTICATE", digestUri, nonceCount)
-			message := "username=" + user + ", realm=" + realm + ", nonce=" + nonce + ", cnonce=" + cnonceStr + ", nc=" + nonceCount + ", qop=" + qop + ", digest-uri=" + digestUri + ", response=" + digest + ", charset=" + charset
-			///fmt.Fprintf(c.conn, "<response xmlns='%s'>%s</response>\n", nsSASL, base64.StdEncoding.EncodeToString([]byte(message)))
-			c.Send(saslResponse{Value: base64.StdEncoding.EncodeToString([]byte(message))})
-
-			var rspauth saslSuccess
-			if err = c.p.DecodeElement(&rspauth, nil); err != nil {
-				return errors.New("unmarshal <success>: " + err.Error())
-			}
-			b, err = base64.StdEncoding.DecodeString(rspauth.Value)
-			if err != nil {
-				return err
-			}
-			//fmt.Println(string(b))
-			///fmt.Fprintf(c.conn, "<response xmlns='%s'/>\n", nsSASL)
-			c.Send(saslResponse{})
-			break
-		}
-	}
-	if mechanism == "" {
-		return errors.New(fmt.Sprintf("PLAIN authentication is not an option: %v", f.Mechanisms.Mechanism))
-	}
-
-	// Next message should be either success or failure.
-	name, val, err := next(c.p)
-	if err != nil {
-		return err
-	}
-	switch v := val.(type) {
-	case *saslSuccess:
-	case *saslFailure:
-		// v.Any is type of sub-element in failure,
-		// which gives a description of what failed.
-		return errors.New("auth failure: " + v.Any.Local)
-	default:
-		return errors.New("expected <success> or <failure>, got <" + name.Local + "> in " + name.Space)
-	}
-
-	// Now that we're authenticated, we're supposed to start the stream over again.
-	// Declare intent to be a jabber client.
-	///fmt.Fprintf(c.conn, streamElem(domain))
-	c.Send(&streamElem{domain: domain})
-
-	// Here comes another <stream> and <features>.
-	se, err = nextStart(c.p)
-	if err != nil {
-		return err
-	}
-	if se.Name.Space != nsStream || se.Name.Local != "stream" {
-		return errors.New("expected <stream>, got <" + se.Name.Local + "> in " + se.Name.Space)
-	}
-	if err = c.p.DecodeElement(&f, nil); err != nil {
-		// TODO: often stream stop.
-		//return os.NewError("unmarshal <features>: " + err.String())
-	}
-
-	//fmt.Println("method:", f.Compress.Method, f.Session.XMLName.Local, f.Bind.XMLName.Local)
-	// Send IQ message asking to bind to the local user name.
-	iq := NewIQ(IQSet, "")
-	if o.Resource == "" {
-		///fmt.Fprintf(c.conn, "<iq type='set' id='x'><bind xmlns='%s'></bind></iq>\n", nsBind)
-		iq.SetElem(bindBind{})
-	} else {
-		//fmt.Fprintf(c.conn, "<iq type='set' id='x'><bind xmlns='%s'><resource>%s</resource></bind></iq>\n", nsBind, o.Resource)
-		iq.SetElem(bindBind{Resource: o.Resource})
-	}
-	c.Send(iq)
-
-	//var iq clientIQ
-	iq.SetElem(bindBind{})
-	if err = c.p.DecodeElement(&iq, nil); err != nil {
-		return errors.New("unmarshal <iq>: " + err.Error())
-	}
-	fmt.Println("afsdfsdf", iq)
-	/*
-		if &iq.Bind == nil {
-			return errors.New("<iq> result missing <bind>")
-		}
-		c.jid = iq.Bind.Jid // our local id
-	*/
-	// We're connected and can now receive and send messages.
-	fmt.Fprintf(c.conn, "<presence xml:lang='en'><show>xa</show><status>I for one welcome our new codebot overlords.</status></presence>")
-	return nil
-}
-
-type Chat struct {
-	Remote string
-	Type   string
-	Text   string
-	Other  []string
-}
-
-type Presence struct {
-	From string
-	To   string
-	Type string
-	Show string
-}
-
-// Recv wait next token of chat.
-func (c *Client) Recv() (event interface{}, err error) {
-	for {
-		_, val, err := next(c.p)
-		if err != nil {
-			return Chat{}, err
-		}
-		switch v := val.(type) {
-		case *clientMessage:
-			return Chat{v.From, v.Type, v.Body, v.Other}, nil
-		case *clientPresence:
-			return Presence{v.From, v.To, v.Type, v.Show}, nil
-		}
-	}
-	panic("unreachable")
-}
-
-/*
-// Send sends message text.
-func (c *Client) Send(chat Chat) {
-	fmt.Fprintf(c.conn, "<message to='%s' type='%s' xml:lang='en'>"+
-		"<body>%s</body></message>",
-		xmlEscape(chat.Remote), xmlEscape(chat.Type), xmlEscape(chat.Text))
-}
-*/
-func (c *Client) Send(elem Elementer) {
-	fmt.Fprint(c.conn, elem.String())
-}
-
-// Send origin
-func (c *Client) SendOrg(org string) {
-	fmt.Fprint(c.conn, org)
-}
-
 // Scan XML token stream to find next StartElement.
 func nextStart(p *xml.Decoder) (xml.StartElement, error) {
 	for {
 		t, err := p.Token()
 		if err != nil && err != io.EOF {
+			fmt.Println(err)
 			return xml.StartElement{}, err
 		}
 		switch t := t.(type) {
@@ -431,69 +509,19 @@ func nextStart(p *xml.Decoder) (xml.StartElement, error) {
 	panic("unreachable")
 }
 
-// Scan XML token stream for next element and save into val.
-// If val == nil, allocate new element based on proto map.
-// Either way, return val.
-func next(p *xml.Decoder) (xml.Name, interface{}, error) {
-	// Read start element to find out what type we want.
-	se, err := nextStart(p)
-	if err != nil {
-		return xml.Name{}, nil, err
-	}
-
-	// Put it in an interface and allocate one.
-	var nv interface{}
-	switch se.Name.Space + " " + se.Name.Local {
-	case nsStream + " features":
-		nv = &streamFeatures{}
-	case nsStream + " error":
-		nv = &streamError{}
-	case nsTLS + " starttls":
-		nv = &tlsStartTLS{}
-	case nsTLS + " proceed":
-		nv = &tlsProceed{}
-	case nsTLS + " failure":
-		nv = &tlsFailure{}
-	case nsSASL + " mechanisms":
-		nv = &saslMechanisms{}
-	case nsSASL + " challenge":
-		nv = ""
-	case nsSASL + " response":
-		nv = ""
-	case nsSASL + " abort":
-		nv = &saslAbort{}
-	case nsSASL + " success":
-		nv = &saslSuccess{}
-	case nsSASL + " failure":
-		nv = &saslFailure{}
-	case nsBind + " bind":
-		nv = &bindBind{}
-	case nsClient + " message":
-		nv = &clientMessage{}
-	case nsClient + " presence":
-		nv = &clientPresence{}
-	case nsClient + " iq":
-		nv = &clientIQ{}
-	case nsClient + " error":
-		nv = &clientError{}
-	default:
-		return xml.Name{}, nil, errors.New("unexpected XMPP message " +
-			se.Name.Space + " <" + se.Name.Local + "/>")
-	}
-
-	// Unmarshal into that storage.
-	if err = p.DecodeElement(nv, &se); err != nil {
-		return xml.Name{}, nil, err
-	}
-	return se.Name, nv, err
-}
-
-type tee struct {
+type Conn struct {
 	c net.Conn
 	w io.Writer
 }
 
-func (t tee) Read(p []byte) (n int, err error) {
+func NewConn(conn net.Conn, logger io.Writer) *Conn {
+	return &Conn{
+		c: conn,
+		w: logger,
+	}
+}
+
+func (t *Conn) Read(p []byte) (n int, err error) {
 	n, err = t.c.Read(p)
 	if n > 0 {
 		t.w.Write([]byte(">>> "))
@@ -503,7 +531,7 @@ func (t tee) Read(p []byte) (n int, err error) {
 	return
 }
 
-func (t tee) Write(p []byte) (n int, err error) {
+func (t *Conn) Write(p []byte) (n int, err error) {
 	n, err = t.c.Write(p)
 	if n > 0 {
 		t.w.Write([]byte("<<< "))
@@ -513,6 +541,22 @@ func (t tee) Write(p []byte) (n int, err error) {
 	return
 }
 
-func (t tee) Close() error {
+func (t *Conn) handshake(host string, config *tls.Config) error {
+	tlsconn := tls.Client(t.c, config)
+	if err := tlsconn.Handshake(); err != nil {
+		return err
+	}
+
+	if strings.LastIndex(host, ":") > 0 {
+		host = host[:strings.LastIndex(host, ":")]
+	}
+	if err := tlsconn.VerifyHostname(host); err != nil {
+		return err
+	}
+	t.c = tlsconn
+	return nil
+}
+
+func (t *Conn) Close() error {
 	return t.c.Close()
 }

@@ -1,13 +1,13 @@
 package main
 
 import (
-	"bufio"
+	//"bufio"
 	"flag"
 	"fmt"
 	"github.com/ginuerzh/go-xmpp"
 	"log"
 	"os"
-	"strings"
+	//"strings"
 )
 
 var server = flag.String("server", "talk.google.com:443", "server")
@@ -17,6 +17,8 @@ var notls = flag.Bool("notls", false, "No TLS")
 var debug = flag.Bool("debug", false, "debug output")
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: example [options]\n")
 		flag.PrintDefaults()
@@ -27,42 +29,39 @@ func main() {
 		flag.Usage()
 	}
 
-	var talk *xmpp.Client
-	var err error
-	if *notls {
-		talk, err = xmpp.NewClientNoTLS(*server, *username, *password, *debug)
-	} else {
-		talk, err = xmpp.NewClient(*server, *username, *password, *debug)
-	}
-	if err != nil {
-		log.Fatal(err)
+	talk := xmpp.Client{
+		Host:     *server,
+		User:     *username,
+		Password: *password,
+		Opts: &xmpp.Options{
+			NoTLS: *notls,
+			Debug: *debug,
+		},
 	}
 
-	go func() {
-		for {
-			chat, err := talk.Recv()
-			if err != nil {
-				log.Fatal(err)
-			}
-			switch v := chat.(type) {
-			case xmpp.Chat:
-				fmt.Println(v.Remote, v.Text)
-			case xmpp.Presence:
-				fmt.Println(v.From, v.Show)
-			}
+	talk.Start()
+	talk.RosterHandleFunc(func(roster *xmpp.Roster) {
+		log.Println("got roster")
+		for _, item := range roster.Items() {
+			fmt.Println(item.Jid)
 		}
-	}()
+	})
+	talk.PresenceHandleFunc(func(p *xmpp.Presence) {
+		log.Println("got presence from", p.Jid)
+	})
+	talk.Send(&xmpp.Presence{})
+	talk.SyncRoster()
+
 	for {
-		in := bufio.NewReader(os.Stdin)
-		line, err := in.ReadString('\n')
+		_, err := talk.Recv()
 		if err != nil {
-			continue
+			log.Fatal(err)
 		}
-		line = strings.TrimRight(line, "\n")
-
-		tokens := strings.SplitN(line, " ", 2)
-		if len(tokens) == 2 {
-			//talk.Send(xmpp.Chat{Remote: tokens[0], Type: "chat", Text: tokens[1]})
-		}
+		//log.Println("recv:", stanza)
 	}
+	/*
+		log.Fatal(talk.StartAndRecv(func(c *xmpp.Client, st xmpp.Stanzar) {
+			log.Println(st, st.Err())
+		}))
+	*/
 }
