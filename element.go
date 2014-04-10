@@ -39,7 +39,7 @@ func streamElement(domain string) []byte {
 	return []byte("<stream:stream " +
 		"xmlns='jabber:client' " +
 		"xmlns:stream='http://etherx.jabber.org/streams' " +
-		"version='1.0' " +
+		"version='1.0'" +
 		" to='" + domain + "'>")
 }
 
@@ -47,17 +47,6 @@ func (s xmppStream) Name() string {
 	return "stream"
 }
 
-/*
-func (s xmppStream) String() string {
-	b := new(bytes.Buffer)
-	xml.EscapeText(b, []byte(s.To))
-
-	return fmt.Sprintf(xml.Header+
-		"<stream:stream to='%s' xmlns='%s'"+
-		" xmlns:stream='%s' version='1.0'>",
-		b.String(), nsClient, nsStream)
-}
-*/
 type iqAuth struct {
 	XMLName xml.Name `xml:"http://jabber.org/features/iq-auth auth"`
 }
@@ -84,23 +73,27 @@ func (e streamFeatures) Name() string {
 
 type streamError struct {
 	XMLName xml.Name `xml:"http://etherx.jabber.org/streams error"`
-	Any     xml.Name
-	Text    string
+	Any     xml.Name `xml:",any"`
+	Text    string   `xml:"text"`
 }
 
 func (e streamError) Name() string {
 	return "stream-error"
 }
 
+func (e streamError) Error() string {
+	return e.Name() + ": " + e.Text
+}
+
 // RFC 3920  C.3  TLS name space
 
 type tlsStartTLS struct {
-	XMLName xml.Name  `xml:"urn:ietf:params:xml:ns:xmpp-tls starttls"`
-	Any     *xml.Name `xml:",any"`
+	XMLName xml.Name `xml:"urn:ietf:params:xml:ns:xmpp-tls starttls"`
+	Require *string  `xml:"required"`
 }
 
 func (e tlsStartTLS) Required() bool {
-	return e.Any != nil && e.Any.Local == "required"
+	return e.Require != nil
 }
 
 func (e tlsStartTLS) Name() string {
@@ -171,7 +164,7 @@ func (e saslAbort) Name() string {
 }
 
 func (e saslAbort) Error() string {
-	return "abort"
+	return "sasl abort"
 }
 
 type saslSuccess struct {
@@ -193,7 +186,7 @@ func (e saslFailure) Name() string {
 }
 
 func (e saslFailure) Error() string {
-	return e.Any.Local
+	return e.Name() + ": " + e.Any.Local
 }
 
 // RFC 3920  C.5  Resource binding name space
